@@ -19,3 +19,6 @@ repos/*
 
 # macOS
 .DS_Store
+
+# Sample Lego manuals: copyrighted material, kept local only.
+docs/samples/

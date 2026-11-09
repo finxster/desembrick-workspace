@@ -108,11 +108,9 @@ dbrick build engine
 dbrick publish
 ```
 
-Both skip repos with no configured command. Today **no build or publish
-commands are configured**: the engine repository is still empty and its
-toolchain (uv vs poetry) is not settled. Once it has a `pyproject.toml`, set
-`DESEMBRICK_REPO_BUILD_CMD_engine` in `repos.conf` (for example
-`"uv run pytest"`). There are no library repos, so `publish` has nothing to do.
+Both skip repos with no configured command. `build engine` runs the engine's
+test suite (`uv run pytest`, which needs [uv](https://docs.astral.sh/uv/)).
+There are no library repos, so `publish` has nothing to do.
 
 ### Runnable apps
 
@@ -133,7 +131,7 @@ dbrick restart api
 long-lived process, so it is not in `DESEMBRICK_APP_KEYS`; until `api` or `web`
 is added there, the commands above exit with
 `no runnable apps configured`. Run the engine directly from its checkout
-(`cd repos/desembrick-engine && python -m desembrick input.pdf --out ./out/`)
+(`cd repos/desembrick-engine && uv run python -m desembrick input.pdf --out ./out/`)
 or through `dbrick foreach '<command>' engine`.
 
 No `reset-db` / `fresh` commands are generated: nothing in this workspace owns
