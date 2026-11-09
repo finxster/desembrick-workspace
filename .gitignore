@@ -1,0 +1,21 @@
+# Repo checkouts (managed by bin/desembrick)
+repos/*
+!repos/.gitkeep
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# Workspace runtime state: pid files, logs, and the saved local defaults in
+# .desembrick/current*.conf (one developer's working set, not configuration).
+.desembrick/
+
+# Git worktrees created next to the checkouts
+.worktrees/
+
+# Claude Code
+.claude/
+
+# macOS
+.DS_Store

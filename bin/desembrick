@@ -1,0 +1,982 @@
+#!/usr/bin/env bash
+# Desembrick multi-repo workspace command.
+# Bash-only orchestration over the repositories configured in repos.conf.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPOS_DIR="${WORKSPACE_ROOT}/repos"
+STATE_DIR="${WORKSPACE_ROOT}/.desembrick"
+RUN_DIR="${STATE_DIR}/run"
+LOG_DIR="${STATE_DIR}/logs"
+# Saved local defaults. Ignored by git: they are one developer's working set,
+# not workspace configuration (which lives in repos.conf).
+CURRENT_FILE="${STATE_DIR}/current.conf"
+CURRENT_APPS_FILE="${STATE_DIR}/current-applications.conf"
+CURRENT_LOG_FILE="${STATE_DIR}/current-log.conf"
+
+# shellcheck source=../repos.conf
+source "${WORKSPACE_ROOT}/repos.conf"
+
+# ---------- colors ----------
+# Truecolor palette shared with the sibling workspaces (blue/green primaries,
+# amber/terracotta accents). Disabled when stdout is not a tty or NO_COLOR is set.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_BLUE=$'\033[38;2;74;127;212m'    # brand primary  #4A7FD4
+  C_GREEN=$'\033[38;2;61;184;75m'    # brand secondary #3DB84B
+  C_ORANGE=$'\033[38;2;231;143;44m'  # star / accent   #E78F2C
+  C_TERRA=$'\033[38;2;196;90;46m'    # urgent          #C45A2E
+  C_RED=$'\033[38;2;231;76;60m'      # danger          #E74C3C
+  C_AMBER=$'\033[38;2;243;156;18m'   # warning         #F39C12
+  C_MUTED=$'\033[38;2;138;154;171m'  # faint text      #8A9AAB
+  C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
+  C_CYAN="$C_BLUE"; C_YELLOW="$C_AMBER"  # back-compat aliases
+else
+  C_BLUE=""; C_GREEN=""; C_ORANGE=""; C_TERRA=""; C_RED=""; C_AMBER=""
+  C_MUTED=""; C_BOLD=""; C_DIM=""; C_RESET=""; C_CYAN=""; C_YELLOW=""
+fi
+
+info()  { printf '%s\n' "${C_BLUE}$*${C_RESET}"; }
+ok()    { printf '%s\n' "${C_GREEN}$*${C_RESET}"; }
+warn()  { printf '%s\n' "${C_AMBER}$*${C_RESET}"; }
+err()   { printf '%s\n' "${C_RED}$*${C_RESET}" >&2; }
+die()   { err "error: $*"; exit 1; }
+# Section header: bold blue title with a green underline accent.
+section() { printf '%s%s%s\n' "${C_BOLD}${C_BLUE}" "$*" "${C_RESET}"; }
+# Table header row (dim, so colored data stands out).
+thead()   { printf '%s%s%s\n' "${C_DIM}" "$*" "${C_RESET}"; }
+
+# ---------- config accessors ----------
+conf() { # conf <VAR_PREFIX> <key> -> value or empty
+  local var="DESEMBRICK_$1_$2"
+  printf '%s' "${!var:-}"
+}
+
+repo_folder() { conf REPO_FOLDER "$1"; }
+repo_path()   { printf '%s' "${REPOS_DIR}/$(repo_folder "$1")"; }
+app_port()    { conf APP_PORT "$1"; }
+app_cmd()     { conf APP_START_CMD "$1"; }
+# printf templates appended to the start command by `start env=` / `start port=`.
+# They are per-app because the flag spelling is build-tool specific: Maven needs
+# -Dspring-boot.run.*, Vite needs `-- --port`. An app with no template refuses
+# the option instead of appending something that would not work.
+app_env_arg()  { conf APP_ENV_ARG "$1"; }
+app_port_arg() { conf APP_PORT_ARG "$1"; }
+
+is_repo_key() {
+  local k
+  for k in "${DESEMBRICK_REPO_KEYS[@]}"; do [[ "$k" == "$1" ]] && return 0; done
+  return 1
+}
+
+is_app_key() {
+  local k
+  for k in ${DESEMBRICK_APP_KEYS[@]+"${DESEMBRICK_APP_KEYS[@]}"}; do [[ "$k" == "$1" ]] && return 0; done
+  return 1
+}
+
+resolve_repo_key() { # accepts key, short alias, folder name, or folder without common prefixes
+  local name="$1" k pair
+  if is_repo_key "$name"; then printf '%s' "$name"; return 0; fi
+  for pair in ${DESEMBRICK_ALIASES[@]+"${DESEMBRICK_ALIASES[@]}"}; do
+    if [[ "$name" == "${pair%%:*}" ]]; then printf '%s' "${pair#*:}"; return 0; fi
+  done
+  for k in "${DESEMBRICK_REPO_KEYS[@]}"; do
+    local folder; folder="$(repo_folder "$k")"
+    if [[ "$name" == "$folder" || "$name" == "${folder#desembrick-}" ]]; then
+      printf '%s' "$k"; return 0
+    fi
+  done
+  return 1
+}
+
+require_apps() { # dies when repos.conf lists no runnable apps (e.g. only CLI repos)
+  [[ ${#DESEMBRICK_APP_KEYS[@]} -gt 0 ]] \
+    || die "no runnable apps configured (DESEMBRICK_APP_KEYS in repos.conf is empty)"
+}
+
+select_repos() { # args -> repo keys (all when no args)
+  if [[ $# -eq 0 ]]; then
+    printf '%s\n' "${DESEMBRICK_REPO_KEYS[@]}"
+    return 0
+  fi
+  local name key
+  for name in "$@"; do
+    key="$(resolve_repo_key "$name")" || die "unknown repo: ${name}"
+    printf '%s\n' "$key"
+  done
+}
+
+select_apps() { # args -> app keys (all when no args)
+  if [[ $# -eq 0 ]]; then
+    [[ ${#DESEMBRICK_APP_KEYS[@]} -gt 0 ]] && printf '%s\n' "${DESEMBRICK_APP_KEYS[@]}"
+    return 0
+  fi
+  local name key
+  for name in "$@"; do
+    key="$(resolve_repo_key "$name")" || die "unknown app: ${name}"
+    is_app_key "$key" || die "not a runnable app: ${name}"
+    printf '%s\n' "$key"
+  done
+}
+
+# ---------- saved local defaults ----------
+# current.conf holds "<repo key>\t<branch>" lines; the other two hold app keys,
+# one per line. All three are rewritten wholesale, never appended blindly.
+
+current_target() { # repo key -> saved branch target, or empty
+  [[ -f "$CURRENT_FILE" ]] || return 0
+  awk -F'\t' -v k="$1" '$1 == k { print $2; exit }' "$CURRENT_FILE"
+}
+
+set_current_target() { # repo key, branch
+  mkdir -p "$STATE_DIR"
+  local tmp; tmp="$(mktemp "${STATE_DIR}/current.XXXXXX")"
+  if [[ -f "$CURRENT_FILE" ]]; then
+    awk -F'\t' -v k="$1" '$1 != k' "$CURRENT_FILE" > "$tmp"
+  fi
+  printf '%s\t%s\n' "$1" "$2" >> "$tmp"
+  LC_ALL=C sort -o "$tmp" "$tmp"
+  mv "$tmp" "$CURRENT_FILE"
+}
+
+clear_current_target() { # repo key
+  [[ -f "$CURRENT_FILE" ]] || return 0
+  local tmp; tmp="$(mktemp "${STATE_DIR}/current.XXXXXX")"
+  awk -F'\t' -v k="$1" '$1 != k' "$CURRENT_FILE" > "$tmp"
+  if [[ -s "$tmp" ]]; then mv "$tmp" "$CURRENT_FILE"; else rm -f "$tmp" "$CURRENT_FILE"; fi
+}
+
+current_apps() { # -> saved default runtime apps, one per line
+  [[ -f "$CURRENT_APPS_FILE" ]] || return 0
+  local key
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    if is_app_key "$key"; then
+      printf '%s\n' "$key"
+    else
+      printf '%s\n' "${C_AMBER}ignoring unknown app in current-applications.conf: ${key}${C_RESET}" >&2
+    fi
+  done < "$CURRENT_APPS_FILE"
+}
+
+current_log_app() { # -> saved default log app, or empty
+  [[ -f "$CURRENT_LOG_FILE" ]] || return 0
+  local key; key="$(head -n 1 "$CURRENT_LOG_FILE")"
+  [[ -n "$key" ]] && is_app_key "$key" && printf '%s' "$key"
+  return 0
+}
+
+select_apps_default() { # args -> app keys; saved current applications when no args, else all
+  if [[ $# -eq 0 ]]; then
+    local saved; saved="$(current_apps)"
+    if [[ -n "$saved" ]]; then printf '%s\n' "$saved"; return 0; fi
+  fi
+  select_apps "$@"
+}
+
+select_log_apps() { # args -> app keys; saved log app, then saved applications, then all
+  if [[ $# -eq 0 ]]; then
+    local one; one="$(current_log_app)"
+    if [[ -n "$one" ]]; then printf '%s\n' "$one"; return 0; fi
+  fi
+  select_apps_default "$@"
+}
+
+require_clone() { # repo key -> dies if missing
+  local path; path="$(repo_path "$1")"
+  [[ -d "${path}/.git" ]] || die "repo '$1' is not cloned (expected ${path}). Run: desembrick clone $1"
+}
+
+is_dirty() { # repo path
+  [[ -n "$(git -C "$1" status --porcelain)" ]]
+}
+
+current_branch() { # repo path -> branch name or "detached@<sha>"
+  local b
+  b="$(git -C "$1" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [[ -n "$b" ]]; then printf '%s' "$b"; else printf 'detached@%s' "$(git -C "$1" rev-parse --short HEAD)"; fi
+}
+
+repo_counts() { # repo path -> "staged unstaged untracked conflicted"
+  git -C "$1" status --porcelain=v1 2>/dev/null | awk '
+    BEGIN { s=0; u=0; q=0; c=0 }
+    {
+      x=substr($0,1,1); y=substr($0,2,1); xy=substr($0,1,2)
+      if (xy=="??") { q++; next }
+      if (xy=="DD"||xy=="AA"||x=="U"||y=="U") { c++; next }
+      if (x!=" ") s++
+      if (y!=" ") u++
+    }
+    END { printf "%d %d %d %d", s, u, q, c }'
+}
+
+repo_ahead_behind() { # repo path -> "<ahead> <behind>" or "" when no upstream
+  local counts
+  counts="$(git -C "$1" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null)" || return 0
+  # rev-list prints "<behind>\t<ahead>" (left=@{u}, right=HEAD)
+  printf '%s %s' "$(printf '%s' "$counts" | cut -f2)" "$(printf '%s' "$counts" | cut -f1)"
+}
+
+# ---------- help ----------
+cmd_help() {
+  cat <<EOF
+${C_BOLD}desembrick${C_RESET} - Desembrick multi-repo workspace command (alias: dbrick)
+
+${C_BOLD}Common local workflows:${C_RESET}
+  desembrick clone                        # clone every configured repo
+  desembrick status --all                 # where every repo stands
+  desembrick status && desembrick pull    # sync everything before working
+  desembrick checkout -b my-feature engine     # new branch carrying local changes
+  desembrick foreach 'uv run pytest' engine    # run a command inside a repo
+
+${C_BOLD}Repository commands:${C_RESET}
+  desembrick list
+  desembrick current
+  desembrick current set <branch> [repo...]
+  desembrick current clear [repo...]
+  desembrick current applications <app...> | clear
+  desembrick current log <app> | clear
+  desembrick clone [--ssh|--https] [repo...]
+  desembrick status [--all] [--details] [--porcelain] [repo...]
+  desembrick diff [--stat] [repo...]
+  desembrick branch [repo...]
+  desembrick fetch [repo...]
+  desembrick pull [repo...]
+  desembrick checkout [-b] [--from <base>] [--current] [branch] [repo...]
+  desembrick build [repo...]
+  desembrick publish [repo...]
+  desembrick foreach <command> [repo...]
+
+${C_BOLD}Runnable app commands:${C_RESET}
+  desembrick start [-f|--follow] [--lines <n>] [app...] [env=<profile>] [port=<n>]
+  desembrick stop [app...]
+  desembrick restart [app...] [env=<profile>] [port=<n>]
+  desembrick ps [app...]
+  desembrick logs [-f|--follow] [--lines <n>] [app...] [port=<n>]
+
+Repos: ${DESEMBRICK_REPO_KEYS[*]}
+Apps:  ${DESEMBRICK_APP_KEYS[*]:-(none configured yet - the engine is a CLI, not a server)}
+
+Repo names accept the key (engine), a short alias (eng), the folder
+(desembrick-engine), or the folder without its 'desembrick-' prefix.
+
+'build' and 'publish' skip repos with no configured command in repos.conf.
+
+With no app arguments, start/stop/restart/ps use the apps saved by
+'current applications' (all apps when none are saved), and logs uses the app
+saved by 'current log'. 'checkout' with no branch uses the targets saved by
+'current set'. Saved state lives in .desembrick/current*.conf and is local only.
+
+'env=' and 'port=' are per-app: they are appended using the app's configured
+DESEMBRICK_APP_ENV_ARG_/DESEMBRICK_APP_PORT_ARG_ template, and an app without one
+refuses the option. A 'port=' run gets its own pid and log file, so it coexists
+with the app on its configured port; plain 'stop <app>' clears both.
+EOF
+}
+
+# ---------- repository commands ----------
+cmd_list() {
+  local key path branch bcol dirty
+  thead "$(printf '%-12s %-24s %s' 'KEY' 'FOLDER' 'BRANCH')"
+  for key in "${DESEMBRICK_REPO_KEYS[@]}"; do
+    path="$(repo_path "$key")"
+    dirty=""
+    if [[ -d "${path}/.git" ]]; then
+      branch="$(current_branch "$path")"; bcol="$C_GREEN"
+      # trailing '*' marks a dirty worktree, like a shell prompt
+      is_dirty "$path" && dirty="${C_TERRA}*${C_RESET}"
+    else
+      branch="missing"; bcol="$C_AMBER"
+    fi
+    printf '%s%-12s%s %s%-24s%s %s%s%s%s\n' \
+      "${C_BOLD}${C_BLUE}" "$key" "$C_RESET" \
+      "$C_MUTED" "$(repo_folder "$key")" "$C_RESET" \
+      "$bcol" "$branch" "$C_RESET" "$dirty"
+  done
+}
+
+# `current` is the saved working set: which branch each repo should be on, which
+# apps `start`/`stop`/`restart`/`ps` act on by default, and which app
+# `logs` tails by default. Purely local state; nothing here is committed.
+cmd_current() {
+  local sub="${1:-show}"
+  [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    show) current_show ;;
+    set)
+      [[ $# -ge 1 ]] || die "usage: desembrick current set <branch> [repo...]"
+      local branch="$1"; shift
+      local key
+      while IFS= read -r key; do
+        set_current_target "$key" "$branch"
+        info "${key}: target branch -> ${branch}"
+      done < <(select_repos "$@")
+      ;;
+    clear)
+      local key
+      while IFS= read -r key; do
+        if [[ -n "$(current_target "$key")" ]]; then
+          clear_current_target "$key"
+          info "${key}: target branch cleared"
+        fi
+      done < <(select_repos "$@")
+      ;;
+    applications|apps)
+      if [[ $# -eq 1 && "$1" == "clear" ]]; then
+        rm -f "$CURRENT_APPS_FILE"
+        ok "current applications cleared"
+        return 0
+      fi
+      [[ $# -ge 1 ]] || die "usage: desembrick current applications <app...> | clear"
+      local apps=() key
+      while IFS= read -r key; do apps+=("$key"); done < <(select_apps "$@")
+      [[ ${#apps[@]} -gt 0 ]] || exit 1  # selection already reported its error
+      mkdir -p "$STATE_DIR"
+      printf '%s\n' "${apps[@]}" > "$CURRENT_APPS_FILE"
+      ok "current applications: ${apps[*]}"
+      ;;
+    log)
+      if [[ $# -eq 1 && "$1" == "clear" ]]; then
+        rm -f "$CURRENT_LOG_FILE"
+        ok "current log app cleared"
+        return 0
+      fi
+      [[ $# -eq 1 ]] || die "usage: desembrick current log <app> | clear"
+      local key; key="$(select_apps "$1")"
+      mkdir -p "$STATE_DIR"
+      printf '%s\n' "$key" > "$CURRENT_LOG_FILE"
+      ok "current log app: ${key}"
+      ;;
+    *) die "unknown 'current' subcommand: ${sub} (set | clear | applications | log)" ;;
+  esac
+}
+
+current_show() {
+  local key target path branch mark any=0
+  section "Branch targets"
+  thead "$(printf '%-12s %-28s %s' 'KEY' 'TARGET' 'CHECKED OUT')"
+  for key in "${DESEMBRICK_REPO_KEYS[@]}"; do
+    target="$(current_target "$key")"
+    [[ -n "$target" ]] || continue
+    any=1
+    path="$(repo_path "$key")"
+    if [[ -d "${path}/.git" ]]; then branch="$(current_branch "$path")"; else branch="missing"; fi
+    # '=' when the repo already sits on its target, '!=' when it drifted.
+    if [[ "$branch" == "$target" ]]; then mark="${C_GREEN}=${C_RESET}"; else mark="${C_AMBER}!=${C_RESET}"; fi
+    printf '%s%-12s%s %s%-28s%s %s %s\n' \
+      "${C_BOLD}${C_BLUE}" "$key" "$C_RESET" "$C_GREEN" "$target" "$C_RESET" "$branch" "$mark"
+  done
+  [[ $any -eq 0 ]] && printf '%s\n' "${C_MUTED}(none saved - use: desembrick current set <branch> [repo...])${C_RESET}"
+
+  printf '\n'
+  section "Runtime defaults"
+  local apps; apps="$(current_apps | tr '\n' ' ')"
+  if [[ -n "${apps// /}" ]]; then
+    printf '%-14s %s%s%s\n' 'applications' "$C_GREEN" "${apps% }" "$C_RESET"
+  else
+    printf '%-14s %s%s%s\n' 'applications' "$C_MUTED" "(none saved - all apps)" "$C_RESET"
+  fi
+  local logapp; logapp="$(current_log_app)"
+  if [[ -n "$logapp" ]]; then
+    printf '%-14s %s%s%s\n' 'log' "$C_GREEN" "$logapp" "$C_RESET"
+  else
+    printf '%-14s %s%s%s\n' 'log' "$C_MUTED" "(none saved - follows the application defaults)" "$C_RESET"
+  fi
+}
+
+cmd_clone() {
+  local mode="https" args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ssh) mode="ssh"; shift ;;
+      --https) mode="https"; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  local key url path
+  while IFS= read -r key; do
+    path="$(repo_path "$key")"
+    if [[ -d "${path}/.git" ]]; then
+      info "skip ${key}: already cloned"
+      continue
+    fi
+    if [[ "$mode" == "ssh" ]]; then url="$(conf REPO_SSH_URL "$key")"; else url="$(conf REPO_HTTPS_URL "$key")"; fi
+    info "cloning ${key} (${mode}) -> ${path}"
+    git clone "$url" "$path"
+  done < <(select_repos "${args[@]+"${args[@]}"}")
+}
+
+cmd_status() {
+  local show_all=0 details=0 porcelain=0 args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) show_all=1; shift ;;
+      --details) details=1; shift ;;
+      --porcelain) porcelain=1; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  if [[ $porcelain -eq 1 ]]; then
+    # Stable, uncolored output for scripts/agents: "<key>\t<state>\t<branch>"
+    # state is one of: clean | dirty | missing.
+    local key path state branch
+    while IFS= read -r key; do
+      path="$(repo_path "$key")"
+      if [[ ! -d "${path}/.git" ]]; then
+        printf '%s\t%s\t%s\n' "$key" "missing" "-"
+        continue
+      fi
+      if is_dirty "$path"; then state="dirty"; else state="clean"; fi
+      branch="$(current_branch "$path")"
+      printf '%s\t%s\t%s\n' "$key" "$state" "$branch"
+    done < <(select_repos "${args[@]+"${args[@]}"}")
+    return 0
+  fi
+  local key path shown=0
+  local dirty branch state_col ab counts s u q c changes track
+  while IFS= read -r key; do
+    path="$(repo_path "$key")"
+    if [[ ! -d "${path}/.git" ]]; then
+      printf '%s%-11s%s %smissing%s\n' "$C_BOLD" "$key" "$C_RESET" "$C_RED" "$C_RESET"
+      shown=1
+      continue
+    fi
+    if is_dirty "$path"; then dirty=1; else dirty=0; fi
+    [[ $dirty -eq 0 && $show_all -eq 0 ]] && continue
+    shown=1
+    branch="$(current_branch "$path")"
+    if [[ $dirty -eq 1 ]]; then state_col="${C_YELLOW}dirty${C_RESET}"; else state_col="${C_GREEN}clean${C_RESET}"; fi
+
+    # ahead/behind vs upstream
+    track=""
+    ab="$(repo_ahead_behind "$path")"
+    if [[ -n "$ab" ]]; then
+      local ahead behind
+      ahead="${ab% *}"; behind="${ab#* }"
+      if [[ "$ahead" != "0" || "$behind" != "0" ]]; then
+        track=" ${C_CYAN}↑${ahead}${C_RESET}${C_RED}↓${behind}${C_RESET}"
+      fi
+    else
+      track=" ${C_DIM}(no upstream)${C_RESET}"
+    fi
+
+    # change breakdown
+    changes=""
+    if [[ $dirty -eq 1 ]]; then
+      read -r s u q c <<<"$(repo_counts "$path")"
+      changes=" ${C_DIM}[${C_RESET}s${s} u${u} ?${q}"
+      [[ "$c" != "0" ]] && changes+=" ${C_RED}!${c}${C_RESET}"
+      changes+="${C_DIM}]${C_RESET}"
+    fi
+
+    printf '%s%-11s%s %s %s%s%s\n' \
+      "$C_BOLD" "$key" "$C_RESET" "$state_col" "$branch" "$track" "$changes"
+    [[ $details -eq 1 ]] && git -C "$path" status --short --branch | sed 's/^/    /'
+  done < <(select_repos "${args[@]+"${args[@]}"}")
+  [[ $shown -eq 0 ]] && ok "all selected repos are clean"
+  return 0
+}
+
+cmd_diff() {
+  local stat=0 args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stat) stat=1; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  local key path untracked
+  while IFS= read -r key; do
+    path="$(repo_path "$key")"
+    [[ -d "${path}/.git" ]] || { warn "${key}: missing"; continue; }
+    section "== ${key} =="
+    if [[ $stat -eq 1 ]]; then
+      git -C "$path" diff --stat HEAD
+    else
+      git -C "$path" diff HEAD
+    fi
+    untracked="$(git -C "$path" ls-files --others --exclude-standard)"
+    if [[ -n "$untracked" ]]; then
+      warn "untracked files:"
+      printf '%s\n' "$untracked" | sed 's/^/    /'
+    fi
+  done < <(select_repos "${args[@]+"${args[@]}"}")
+}
+
+cmd_branch() {
+  local key path
+  while IFS= read -r key; do
+    path="$(repo_path "$key")"
+    if [[ -d "${path}/.git" ]]; then
+      printf '%s%-12s%s %s%s%s\n' "${C_BOLD}${C_BLUE}" "$key" "$C_RESET" "$C_GREEN" "$(current_branch "$path")" "$C_RESET"
+    else
+      printf '%s%-12s%s %smissing%s\n' "${C_BOLD}${C_BLUE}" "$key" "$C_RESET" "$C_AMBER" "$C_RESET"
+    fi
+  done < <(select_repos "$@")
+}
+
+cmd_fetch() {
+  local key path failures=()
+  while IFS= read -r key; do
+    path="$(repo_path "$key")"
+    [[ -d "${path}/.git" ]] || { warn "${key}: missing"; continue; }
+    info "fetching ${key}"
+    git -C "$path" fetch --prune || failures+=("$key")
+  done < <(select_repos "$@")
+  if [[ ${#failures[@]} -gt 0 ]]; then
+    die "fetch failed for: ${failures[*]}"
+  fi
+  ok "fetch complete"
+}
+
+cmd_pull() {
+  local key path branch failures=()
+  while IFS= read -r key; do
+    path="$(repo_path "$key")"
+    [[ -d "${path}/.git" ]] || { warn "${key}: missing"; continue; }
+    if is_dirty "$path"; then
+      err "${key}: refusing to pull a dirty worktree"
+      failures+=("$key")
+      continue
+    fi
+    branch="$(current_branch "$path")"
+    if [[ "$branch" == detached@* ]]; then
+      err "${key}: refusing to pull a detached HEAD (${branch})"
+      failures+=("$key")
+      continue
+    fi
+    info "pulling ${key} (${branch})"
+    git -C "$path" pull --ff-only || failures+=("$key")
+  done < <(select_repos "$@")
+  if [[ ${#failures[@]} -gt 0 ]]; then
+    die "pull failed for: ${failures[*]}"
+  fi
+  ok "pull complete"
+}
+
+cmd_checkout() {
+  # -b/--create: create the branch (carrying local changes) instead of switching
+  #              to an existing one; allowed over a dirty worktree.
+  # --from <base>: base new branches on <base> regardless of current HEAD.
+  # --current: take the branch per repo from the saved targets (`current set`).
+  local create=0 base="" use_current=0 args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -b|--create) create=1; shift ;;
+      --from) base="$2"; shift 2 ;;
+      --from=*) base="${1#*=}"; shift ;;
+      --current) use_current=1; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  [[ -n "$base" && $create -eq 0 ]] && die "--from requires -b/--create"
+  set -- "${args[@]+"${args[@]}"}"
+
+  # With no branch argument, fall back to the saved per-repo targets. A first
+  # argument that names a repo is a repo, not a branch — so `checkout web` uses
+  # web's saved target rather than looking for a branch called "web". Pass
+  # --current to make that explicit, or an explicit branch to override.
+  if [[ $use_current -eq 0 && $# -ge 1 ]] && ! resolve_repo_key "$1" >/dev/null 2>&1; then
+    local branch="$1"; shift
+    local key
+    while IFS= read -r key; do
+      checkout_one "$key" "$branch" "$create" "$base"
+    done < <(select_repos "$@")
+    return 0
+  fi
+
+  local key target skipped=()
+  while IFS= read -r key; do
+    target="$(current_target "$key")"
+    if [[ -z "$target" ]]; then skipped+=("$key"); continue; fi
+    checkout_one "$key" "$target" "$create" "$base"
+  done < <(select_repos "$@")
+  [[ ${#skipped[@]} -gt 0 ]] && info "no saved target, skipped: ${skipped[*]}"
+  return 0
+}
+
+checkout_one() { # repo key, branch, create(0|1), base
+  local key="$1" branch="$2" create="$3" base="$4" path
+  path="$(repo_path "$key")"
+  [[ -d "${path}/.git" ]] || { warn "${key}: missing"; return 0; }
+  if [[ $create -eq 1 ]]; then
+    # Creating a branch preserves uncommitted work, so a dirty worktree is fine.
+    if git -C "$path" show-ref --verify --quiet "refs/heads/${branch}"; then
+      die "${key}: branch '${branch}' already exists (drop -b to switch to it)"
+    fi
+    if [[ -n "$base" ]]; then
+      info "checkout ${key} -> new ${branch} (from ${base})"
+      git -C "$path" switch -c "$branch" "$base"
+    else
+      info "checkout ${key} -> new ${branch}"
+      git -C "$path" switch -c "$branch"
+    fi
+    return 0
+  fi
+  if is_dirty "$path"; then
+    die "${key}: refusing to checkout over a dirty worktree (use -b to create a branch carrying local changes)"
+  fi
+  info "checkout ${key} -> ${branch}"
+  git -C "$path" fetch origin --prune
+  if git -C "$path" show-ref --verify --quiet "refs/heads/${branch}"; then
+    git -C "$path" switch "$branch"
+  elif git -C "$path" show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+    git -C "$path" switch --track "origin/${branch}"
+  else
+    git -C "$path" switch -c "$branch"
+  fi
+  if git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    git -C "$path" merge --ff-only '@{u}' || warn "${key}: could not fast-forward ${branch}"
+  fi
+}
+
+run_configured_cmd() { # <CONF_PREFIX> <label> [repo...]
+  local prefix="$1" label="$2"; shift 2
+  local key path cmd failures=()
+  while IFS= read -r key; do
+    cmd="$(conf "$prefix" "$key")"
+    if [[ -z "$cmd" ]]; then
+      warn "skip ${key}: no ${label} command configured"
+      continue
+    fi
+    path="$(repo_path "$key")"
+    [[ -d "${path}/.git" ]] || { warn "skip ${key}: not cloned"; continue; }
+    info "== ${label} ${key}: ${cmd} =="
+    (cd "$path" && bash -c "$cmd") || failures+=("$key")
+  done < <(select_repos "$@")
+  if [[ ${#failures[@]} -gt 0 ]]; then
+    die "${label} failed for: ${failures[*]}"
+  fi
+  ok "${label} complete"
+}
+
+
+cmd_build()   { run_configured_cmd REPO_BUILD_CMD build "$@"; }
+cmd_publish() { run_configured_cmd REPO_PUBLISH_CMD publish "$@"; }
+
+cmd_foreach() {
+  [[ $# -ge 1 ]] || die "usage: desembrick foreach <command> [repo...]"
+  local command="$1"; shift
+  local key path failures=()
+  while IFS= read -r key; do
+    path="$(repo_path "$key")"
+    [[ -d "${path}/.git" ]] || { warn "skip ${key}: not cloned"; continue; }
+    info "== ${key} =="
+    (cd "$path" && bash -c "$command") || failures+=("$key")
+  done < <(select_repos "$@")
+  if [[ ${#failures[@]} -gt 0 ]]; then
+    die "command failed in: ${failures[*]}"
+  fi
+}
+
+# ---------- app process management ----------
+# A `start port=<n>` run gets its own pid and log file, so it can coexist with
+# the app on its configured port instead of fighting over one pid file.
+pid_file() { # app key [port]
+  if [[ -n "${2:-}" ]]; then printf '%s' "${RUN_DIR}/$1-$2.pid"; else printf '%s' "${RUN_DIR}/$1.pid"; fi
+}
+log_file() { # app key [port]
+  if [[ -n "${2:-}" ]]; then printf '%s' "${LOG_DIR}/$1-$2.log"; else printf '%s' "${LOG_DIR}/$1.log"; fi
+}
+
+pid_alive() { [[ -n "$1" ]] && kill -0 "$1" 2>/dev/null; }
+
+port_listener() { # app key [port] -> pid listening on that port (default: configured), or empty
+  local port="${2:-}"
+  [[ -n "$port" ]] || port="$(app_port "$1")"
+  [[ -n "$port" ]] || return 0
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true
+}
+
+port_runs() { # app key -> ports of port-specific runs that have a pid file
+  local pf port
+  for pf in "${RUN_DIR}/$1"-*.pid; do
+    [[ -e "$pf" ]] || continue
+    port="${pf##*/}"; port="${port#"$1-"}"; port="${port%.pid}"
+    [[ "$port" =~ ^[0-9]+$ ]] && printf '%s\n' "$port"
+  done
+}
+
+kill_tree() { # pid [signal] -> terminate a process and all its descendants (children first)
+  local pid="$1" sig="${2:-TERM}" child
+  [[ -n "$pid" ]] || return 0
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_tree "$child" "$sig"
+  done
+  kill -"$sig" "$pid" 2>/dev/null || true
+}
+
+ensure_java_home() { # make ./mvnw work even when sdkman/PATH isn't loaded (cron, scripts, some IDEs)
+  # sdkman's init lives in interactive rc files (~/.zshrc) and only edits PATH,
+  # never JAVA_HOME. Resolve a JDK here so `dbrick start api` works from any shell.
+  [[ -n "${JAVA_HOME:-}" && -x "${JAVA_HOME}/bin/java" ]] && return 0
+  # Respect a real java already on PATH, but skip macOS's /usr/bin/java stub:
+  # it always exists and delegates to /usr/libexec/java_home, which cannot see
+  # sdkman-installed JDKs (~/.sdkman/...), so it is not proof of a usable JDK.
+  local onpath; onpath="$(command -v java 2>/dev/null || true)"
+  [[ -n "$onpath" && "$onpath" != "/usr/bin/java" ]] && return 0
+  local candidate
+  for candidate in \
+      "${SDKMAN_DIR:-${HOME}/.sdkman}/candidates/java/current" \
+      "$([[ -x /usr/libexec/java_home ]] && /usr/libexec/java_home 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "${candidate}/bin/java" ]]; then
+      export JAVA_HOME="$candidate"
+      return 0
+    fi
+  done
+  return 0  # nothing definitive: let mvnw print its own clear error
+}
+
+find_app_process() { # app key [port] -> pid matching repo path + command (+ port), or empty
+  local path cmd port="${2:-}"
+  path="$(repo_path "$1")"
+  cmd="$(app_cmd "$1")"
+  ps -axo pid=,command= | while read -r pid command; do
+    if [[ "$command" == *"$path"* && "$command" == *"$cmd"* ]]; then
+      # A port-specific run must carry that port on its command line, so the
+      # default run on the configured port is never mistaken for it.
+      [[ -n "$port" && "$command" != *"$port"* ]] && continue
+      printf '%s\n' "$pid"
+    fi
+  done | head -n 1
+}
+
+app_pid() { # app key [port] -> live managed pid, adopting orphans/port listeners into the pid file
+  local key="$1" port="${2:-}" pid=""
+  local pf; pf="$(pid_file "$key" "$port")"
+  if [[ -f "$pf" ]]; then
+    pid="$(cat "$pf")"
+    if pid_alive "$pid"; then printf '%s' "$pid"; return 0; fi
+    rm -f "$pf"
+  fi
+  pid="$(find_app_process "$key" "$port")"
+  [[ -z "$pid" ]] && pid="$(port_listener "$key" "$port")"
+  if pid_alive "$pid"; then
+    mkdir -p "$RUN_DIR"
+    printf '%s\n' "$pid" > "$pf"
+    printf '%s' "$pid"
+  fi
+}
+
+cmd_start() {
+  require_apps
+  local follow=0 lines=40 profile="" port="" args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow=1; shift ;;
+      --lines) lines="$2"; shift 2 ;;
+      env=*)  profile="${1#env=}"; shift ;;
+      port=*) port="${1#port=}"; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  # Both values end up inside a `bash -c` string, so validate them rather than
+  # quoting: a conservative allowlist is easier to be sure about.
+  if [[ -n "$profile" ]]; then
+    [[ "$profile" =~ ^[A-Za-z0-9._,-]+$ ]] || die "invalid env profile: ${profile}"
+  fi
+  if [[ -n "$port" ]]; then
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "invalid port: ${port}"
+  fi
+
+  local apps=() key
+  while IFS= read -r key; do apps+=("$key"); done < <(select_apps_default "${args[@]+"${args[@]}"}")
+  [[ ${#apps[@]} -gt 0 ]] || exit 1  # selection already reported its error
+  [[ $follow -eq 1 && ${#apps[@]} -ne 1 ]] && die "--follow supports exactly one app"
+  # A port belongs to one process; applying it to several apps would put them
+  # all on the same port.
+  [[ -n "$port" && ${#apps[@]} -ne 1 ]] && die "port= supports exactly one app"
+
+  mkdir -p "$RUN_DIR" "$LOG_DIR"
+  local path cmd pid lf pf tmpl
+  for key in "${apps[@]}"; do
+    require_clone "$key"
+    pid="$(app_pid "$key" "$port")"
+    if [[ -n "$pid" ]]; then
+      info "${key}: already running (pid ${pid}, adopted into pid file)"
+      continue
+    fi
+    path="$(repo_path "$key")"
+    cmd="$(app_cmd "$key")"
+    if [[ -n "$profile" ]]; then
+      tmpl="$(app_env_arg "$key")"
+      [[ -n "$tmpl" ]] || die "${key}: env= is not supported (no DESEMBRICK_APP_ENV_ARG_${key} configured)"
+      cmd+=" $(printf -- "$tmpl" "$profile")"
+    fi
+    if [[ -n "$port" ]]; then
+      tmpl="$(app_port_arg "$key")"
+      [[ -n "$tmpl" ]] || die "${key}: port= is not supported (no DESEMBRICK_APP_PORT_ARG_${key} configured)"
+      cmd+=" $(printf -- "$tmpl" "$port")"
+    fi
+    [[ "$cmd" == *mvnw* ]] && ensure_java_home
+    lf="$(log_file "$key" "$port")"
+    pf="$(pid_file "$key" "$port")"
+    {
+      printf '=== %s start: %s (cwd %s) ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$cmd" "$path"
+    } >> "$lf"
+    (cd "$path" && nohup bash -c "$cmd" >> "$lf" 2>&1 & echo $! > "$pf")
+    pid="$(cat "$pf")"
+    ok "${key}: started (pid ${pid}, port ${port:-$(app_port "$key")}, log ${lf})"
+  done
+  if [[ $follow -eq 1 ]]; then
+    tail -n "$lines" -f "$(log_file "${apps[0]}" "$port")"
+  fi
+}
+
+stop_one() { # app key [port]
+  local key="$1" port="${2:-}" pid pf listener waited label
+  pf="$(pid_file "$key" "$port")"
+  label="${key}${port:+ (port ${port})}"
+  pid="$(app_pid "$key" "$port")"
+  if [[ -n "$pid" ]]; then
+    info "stopping ${label} (pid ${pid})"
+    # Kill the whole tree: `./mvnw spring-boot:run` forks a child JVM that
+    # survives a plain kill of the wrapper and keeps holding the port.
+    kill_tree "$pid" TERM
+    waited=0
+    while pid_alive "$pid" && (( waited < 20 )); do sleep 0.25; waited=$((waited + 1)); done
+    pid_alive "$pid" && kill_tree "$pid" KILL
+    ok "${label}: stopped"
+  else
+    info "${label}: not running"
+  fi
+  # Safety net: whatever is still bound to the port (e.g. a reparented fork).
+  listener="$(port_listener "$key" "$port")"
+  if [[ -n "$listener" ]]; then
+    warn "stopping process still on ${label} port (pid ${listener})"
+    kill_tree "$listener" TERM
+    waited=0
+    while [[ -n "$(port_listener "$key" "$port")" ]] && (( waited < 20 )); do sleep 0.25; waited=$((waited + 1)); done
+    listener="$(port_listener "$key" "$port")"
+    [[ -n "$listener" ]] && kill_tree "$listener" KILL
+  fi
+  rm -f "$pf"
+}
+
+# `stop <app>` means the app, all of it: the run on its configured port and every
+# `start port=` run, each with its own pid file to clear.
+cmd_stop() {
+  require_apps
+  local key port
+  while IFS= read -r key; do
+    while IFS= read -r port; do
+      [[ -n "$port" ]] && stop_one "$key" "$port"
+    done < <(port_runs "$key")
+    stop_one "$key" ""
+  done < <(select_apps_default "$@")
+}
+
+cmd_restart() {
+  require_apps
+  # `stop` takes app names only, so the runtime options ride along to `start`.
+  local start_args=() stop_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow)    start_args+=("$1"); shift ;;
+      --lines)        start_args+=("$1" "$2"); shift 2 ;;
+      env=*|port=*)   start_args+=("$1"); shift ;;
+      *)              start_args+=("$1"); stop_args+=("$1"); shift ;;
+    esac
+  done
+  cmd_stop "${stop_args[@]+"${stop_args[@]}"}"
+  cmd_start "${start_args[@]+"${start_args[@]}"}"
+}
+
+ps_row() { # app key, label, port ("" = configured port)
+  local key="$1" label="$2" port="${3:-}" path pid pf state scol
+  path="$(repo_path "$key")"
+  pf="$(pid_file "$key" "$port")"
+  if [[ ! -d "${path}/.git" ]]; then
+    state="missing"; scol="$C_RED"; pid="-"
+  elif [[ -f "$pf" ]] && pid_alive "$(cat "$pf")"; then
+    state="running"; scol="$C_GREEN"; pid="$(cat "$pf")"
+  else
+    pid="$(find_app_process "$key" "$port")"
+    [[ -z "$pid" ]] && pid="$(port_listener "$key" "$port")"
+    if [[ -n "$pid" ]]; then
+      state="orphaned"; scol="$C_ORANGE"
+    elif [[ -f "$pf" ]]; then
+      state="stale"; scol="$C_AMBER"; pid="-"
+    else
+      state="stopped"; scol="$C_MUTED"; pid="-"
+    fi
+  fi
+  printf '%s%-16s%s %s%-9s%s %-8s %s%s%s\n' \
+    "${C_BOLD}${C_BLUE}" "$label" "$C_RESET" \
+    "$scol" "$state" "$C_RESET" \
+    "${pid:--}" "$C_BLUE" "${port:-$(app_port "$key")}" "$C_RESET"
+}
+
+cmd_ps() {
+  require_apps
+  local key port
+  thead "$(printf '%-16s %-9s %-8s %s' 'APP' 'STATE' 'PID' 'PORT')"
+  while IFS= read -r key; do
+    ps_row "$key" "$key" ""
+    # Extra rows for `start port=` runs, which have pid/log files of their own.
+    while IFS= read -r port; do
+      [[ -n "$port" ]] && ps_row "$key" "${key}:${port}" "$port"
+    done < <(port_runs "$key")
+  done < <(select_apps_default "$@")
+}
+
+cmd_logs() {
+  require_apps
+  local follow=0 lines=40 port="" args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow) follow=1; shift ;;
+      --lines) lines="$2"; shift 2 ;;
+      port=*) port="${1#port=}"; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  if [[ -n "$port" ]]; then
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "invalid port: ${port}"
+  fi
+  local apps=() key lf
+  while IFS= read -r key; do apps+=("$key"); done < <(select_log_apps "${args[@]+"${args[@]}"}")
+  [[ ${#apps[@]} -gt 0 ]] || exit 1  # selection already reported its error
+  [[ $follow -eq 1 && ${#apps[@]} -ne 1 ]] && die "--follow supports exactly one app"
+  [[ -n "$port" && ${#apps[@]} -ne 1 ]] && die "port= supports exactly one app"
+  for key in "${apps[@]}"; do
+    lf="$(log_file "$key" "$port")"
+    [[ -f "$lf" ]] || { warn "${key}${port:+ (port ${port})}: no log file yet"; continue; }
+    info "== ${key}${port:+ (port ${port})} (${lf}) =="
+    if [[ $follow -eq 1 ]]; then
+      tail -n "$lines" -f "$lf"
+    else
+      tail -n "$lines" "$lf"
+    fi
+  done
+}
+
+# ---------- dispatch ----------
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    help|-h|--help) cmd_help ;;
+    list)      cmd_list "$@" ;;
+    current)   cmd_current "$@" ;;
+    clone)     cmd_clone "$@" ;;
+    status)    cmd_status "$@" ;;
+    diff)      cmd_diff "$@" ;;
+    branch)    cmd_branch "$@" ;;
+    fetch)     cmd_fetch "$@" ;;
+    pull)      cmd_pull "$@" ;;
+    checkout)  cmd_checkout "$@" ;;
+    build)     cmd_build "$@" ;;
+    publish)   cmd_publish "$@" ;;
+    foreach)   cmd_foreach "$@" ;;
+    start)     cmd_start "$@" ;;
+    stop)      cmd_stop "$@" ;;
+    restart)   cmd_restart "$@" ;;
+    ps)        cmd_ps "$@" ;;
+    logs)      cmd_logs "$@" ;;
+    *) die "unknown command: ${cmd} (run 'desembrick help')" ;;
+  esac
+}
+
+main "$@"
