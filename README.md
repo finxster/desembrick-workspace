@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/brand/svg/logo.svg" alt="Desembrick" width="320"></p>
+
 # Desembrick Workspace
 
 A lightweight, Bash-only orchestration workspace for the **Desembrick** project

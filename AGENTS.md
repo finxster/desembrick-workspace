@@ -33,6 +33,20 @@ The one contract already known is the engine's output JSON, which the future
 The engine must keep working fully standalone: command line only, inputs via
 arguments or JSON, outputs under `--out`, no database or external service.
 
+## Brand
+
+The visual identity lives in `docs/brand/`: `README.md` (rules summary, pt-BR),
+`tokens.css` (colors light/dark, typography, radii, bag color cycle `.db-bag`),
+`svg/` (logo, symbol, wordmark, app icon, favicon) and the full guide PDF.
+Treat it as the source of truth:
+
+- `web` copies `tokens.css` and the SVGs it needs (favicon, logo) into its own
+  tree; do not reference the workspace path at runtime.
+- `engine` follows the "Página do manual reverso" rules for its output PDF
+  (bag number block in the bag color, six-column parts grid).
+- UI copy follows the voice section: pt-BR first, English alongside; never use
+  block manufacturer names.
+
 ## Dependency Order
 
 1. `engine`
@@ -48,6 +62,7 @@ arguments or JSON, outputs under `--out`, no database or external service.
 | Engine CLI flags, `--debug` artifacts | `engine` |
 | HTTP endpoints, persistence, job orchestration | `api` (planned) |
 | User interface | `web` (planned) |
+| Brand guide, logos, design tokens | this workspace (`docs/brand/`) |
 | Repo list, commands, ports, workspace tooling | this workspace (`repos.conf`, `bin/desembrick`) |
 
 A change to the output JSON shape starts in `engine` and must be followed
