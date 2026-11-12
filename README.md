@@ -73,22 +73,35 @@ Open http://localhost:5173, upload a manual, wait, download.
 
 ## Deploy (all free tiers)
 
-1. **Cloudflare R2:** create bucket `desembrick-jobs`, add a lifecycle rule
-   deleting objects after 1 day, and an R2 API token (Object Read & Write,
-   this bucket only). Note the S3 endpoint `https://<account-id>.r2.cloudflarestorage.com`.
+1. **Cloudflare R2:** create bucket `desembrick-jobs` with two lifecycle rules,
+   prefix `jobs/` deleted after 1 day and prefix `audit/` after 90 days (not a
+   whole-bucket rule), and an R2 API token (Object Read & Write, this bucket only). Note the S3 endpoint `https://<account-id>.r2.cloudflarestorage.com`.
 2. **GitHub, `desembrick-engine`:** add repo secrets `R2_ACCESS_KEY_ID`,
    `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, `R2_BUCKET`, and push `main` (the
    workflow must be on the default branch to be dispatched). Test it with
    *Actions → process → Run workflow* after uploading a PDF to `jobs/<id>/input/1.pdf`.
 3. **GitHub token:** fine-grained token, repository `desembrick-engine` only,
-   permission *Actions: Read and write*.
+   permission *Actions: Read and write*, with an expiry date (rotate it).
+   **Turnstile:** create a widget in **Managed** mode for the Pages domain; note
+   the site key and secret.
 4. **api:** `cd repos/desembrick-api && npx wrangler login`,
-   `npx wrangler secret put GITHUB_TOKEN`, then `npm run deploy`. Note the
+   `npx wrangler secret put` for `GITHUB_TOKEN`, `TURNSTILE_SECRET` and
+   `AUDIT_SALT` (a long random string), then `npm run deploy`. Note the
    `*.workers.dev` URL.
 5. **web:** Cloudflare Pages → connect `desembrick-web` (build `npm run build`,
-   output `dist`, env `VITE_API_BASE=<worker URL>`). Note the `*.pages.dev` URL.
+   output `dist`, env `VITE_API_BASE=<worker URL>` and
+   `VITE_TURNSTILE_SITE_KEY=<site key>`). Note the `*.pages.dev` URL.
 6. **Close the loop:** set `ALLOWED_ORIGIN` in `repos/desembrick-api/wrangler.toml`
    to the Pages URL (comma-separate to keep localhost) and `npm run deploy` again.
+
+### Abuse protection and audit
+
+- `POST /api/jobs` needs a Turnstile token and is limited to 5 per minute per IP.
+- Every api event is one JSON line in Workers Logs (dashboard → Workers → Logs).
+- Per job, `audit/<id>/api.json` (when, hashed IP, country, user agent, upload
+  sizes) and `audit/<id>/runner.json` (Actions run id and URL, input sha256,
+  set, outcome) are kept for 90 days. IPs are only stored as salted hashes (LGPD).
+- The engine repo is private, so Actions logs are visible to collaborators only.
 
 ## Commands
 

@@ -44,6 +44,9 @@ Jobs are anonymous. State lives in `jobs/<id>/status.json` in R2 (no database):
 `uploading → queued → running → done | error`. Engine outputs are copied as is
 under `jobs/<id>/out/`. The engine never needs a server: the runner only wraps
 the CLI. Changing the R2 layout or `status.json` touches all three repos.
+Job creation needs a Turnstile token (managed mode) and is rate limited per IP.
+Audit records live in `audit/<id>/api.json` (api) and `audit/<id>/runner.json`
+(runner), kept 90 days; IPs only as salted hashes.
 
 ## Brand
 
