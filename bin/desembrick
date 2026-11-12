@@ -256,7 +256,7 @@ ${C_BOLD}Runnable app commands:${C_RESET}
   desembrick logs [-f|--follow] [--lines <n>] [app...] [port=<n>]
 
 Repos: ${DESEMBRICK_REPO_KEYS[*]}
-Apps:  ${DESEMBRICK_APP_KEYS[*]:-(none configured yet - the engine is a CLI, not a server)}
+Apps:  ${DESEMBRICK_APP_KEYS[*]:-(none configured)}
 
 Repo names accept the key (engine), a short alias (eng), the folder
 (desembrick-engine), or the folder without its 'desembrick-' prefix.

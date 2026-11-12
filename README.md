@@ -15,12 +15,9 @@ its original bags.
 
 | Key | Folder | What it is | Status |
 |---|---|---|---|
-| `engine` | `desembrick-engine` | Python processing engine (CLI): PDF manual in, parts-per-bag PDF + JSON out | configured |
-| `api` | `desembrick-api` | Spring Boot backend | planned, not created yet |
-| `web` | `desembrick-web` | Vue frontend | planned, not created yet |
-
-Only `engine` is active in `repos.conf`. `api` and `web` are commented
-placeholders there; uncomment them when the repositories exist.
+| `engine` | `desembrick-engine` | Python processing engine (CLI): PDF manual in, parts-per-bag PDF + JSON out; GitHub Actions runner | configured |
+| `api` | `desembrick-api` | Cloudflare Worker (TypeScript, Hono): jobs, uploads to R2, dispatches the runner | configured |
+| `web` | `desembrick-web` | Vue 3 + Vite SPA on Cloudflare Pages | configured |
 
 ## Setup
 
@@ -56,6 +53,42 @@ dbrick status && dbrick pull          # sync everything before working
 dbrick checkout -b my-feature engine  # new branch carrying local changes
 dbrick foreach 'uv run pytest' engine # run a command inside a repo
 ```
+
+## Run everything locally
+
+No Cloudflare or GitHub account needed: the Worker uses a local R2, and the
+engine's local runner plays the part of GitHub Actions:
+
+```bash
+dbrick start          # engine runner :8790, api :8787, web :5173
+dbrick ps             # what is running
+dbrick logs api -f    # follow one app's log
+dbrick stop
+```
+
+The first `start` creates `repos/desembrick-api/.dev.vars` from the example, which
+points the api at the local runner.
+
+Open http://localhost:5173, upload a manual, wait, download.
+
+## Deploy (all free tiers)
+
+1. **Cloudflare R2:** create bucket `desembrick-jobs`, add a lifecycle rule
+   deleting objects after 1 day, and an R2 API token (Object Read & Write,
+   this bucket only). Note the S3 endpoint `https://<account-id>.r2.cloudflarestorage.com`.
+2. **GitHub, `desembrick-engine`:** add repo secrets `R2_ACCESS_KEY_ID`,
+   `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, `R2_BUCKET`, and push `main` (the
+   workflow must be on the default branch to be dispatched). Test it with
+   *Actions → process → Run workflow* after uploading a PDF to `jobs/<id>/input/1.pdf`.
+3. **GitHub token:** fine-grained token, repository `desembrick-engine` only,
+   permission *Actions: Read and write*.
+4. **api:** `cd repos/desembrick-api && npx wrangler login`,
+   `npx wrangler secret put GITHUB_TOKEN`, then `npm run deploy`. Note the
+   `*.workers.dev` URL.
+5. **web:** Cloudflare Pages → connect `desembrick-web` (build `npm run build`,
+   output `dist`, env `VITE_API_BASE=<worker URL>`). Note the `*.pages.dev` URL.
+6. **Close the loop:** set `ALLOWED_ORIGIN` in `repos/desembrick-api/wrangler.toml`
+   to the Pages URL (comma-separate to keep localhost) and `npm run deploy` again.
 
 ## Commands
 
@@ -129,12 +162,10 @@ dbrick stop api
 dbrick restart api
 ```
 
-**No runnable apps are configured yet.** The engine is a one-shot CLI, not a
-long-lived process, so it is not in `DESEMBRICK_APP_KEYS`; until `api` or `web`
-is added there, the commands above exit with
-`no runnable apps configured`. Run the engine directly from its checkout
-(`cd repos/desembrick-engine && uv run python -m desembrick input.pdf --out ./out/`)
-or through `dbrick foreach '<command>' engine`.
+Apps: `engine` (8790) runs `runner/local_server.py`, the local stand-in for
+GitHub Actions; `api` (8787) is `wrangler dev`; `web` (5173) is Vite. The engine
+CLI itself still runs directly:
+`cd repos/desembrick-engine && uv run python -m desembrick input.pdf --out ./out/`.
 
 No `reset-db` / `fresh` commands are generated: nothing in this workspace owns
 a local database yet.
@@ -144,7 +175,7 @@ a local database yet.
 - Start from `desembrick-workspace`.
 - Run `dbrick status` before cross-repo edits.
 - Create a repo-by-repo plan before editing (save longer plans under `plans/`).
-- Read the root `AGENTS.md` and the affected repo's own `AGENTS.md` / `CLAUDE.md`.
+- Read the root `CLAUDE.md` and the affected repo's own `CLAUDE.md`.
 - Split subagents by repo ownership when a change spans several repos.
 - Do not revert unrelated changes.
 - Validate in dependency order: `engine`, then `api`, then `web`.
