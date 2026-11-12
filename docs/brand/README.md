@@ -38,10 +38,10 @@ Sufixos: sem sufixo = fundo claro; `-negative` = fundo escuro; `-mono` e `-mono-
 
 ## Voz e tom
 
-- Português do Brasil primeiro, inglês ao lado.
+- Um idioma por vez: português do Brasil ou inglês, conforme a escolha da pessoa ou o idioma do navegador. Nunca os dois lado a lado.
 - Frases curtas, verbo no começo: diga o que aconteceu e o próximo passo.
 - Humor leve em sucessos e telas vazias; em erros, só clareza. Nunca infantil.
-- Vocabulário: "blocos de montar", "tijolinho", "set", "saco". Nunca nomes de fabricantes ou de linhas de produto.
+- Vocabulário: "blocos de montar", "tijolinho", "set", "saco". Nomes de fabricantes só para dizer com o que funciona ("manuais de instrução LEGO®"), sempre com ®, em poucos lugares (texto de apoio do topo, FAQ, descrição para buscadores) e no aviso de marca registrada. Nunca no nome do produto, no logo, em títulos ou dando a entender que o site é oficial. Linhas de produto, nunca.
 
 | Situação | Português | English |
 |---|---|---|

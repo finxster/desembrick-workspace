@@ -59,8 +59,11 @@ Treat it as the source of truth:
   tree; do not reference the workspace path at runtime.
 - `engine` follows the "Página do manual reverso" rules for its output PDF
   (bag number block in the bag color, six-column parts grid).
-- UI copy follows the voice section: pt-BR first, English alongside; never use
-  block manufacturer names.
+- UI copy follows the voice section: one language at a time (pt-BR or en-US,
+  picked by the user or the browser). The manufacturer's name only describes
+  compatibility ("LEGO® instruction manuals"), with ®, in a few places (hero
+  lead, FAQ, meta description) plus the footer trademark notice; never in the
+  product name, logo, headings or as if the site were official.
 
 ## Dependency Order
 
