@@ -35,6 +35,9 @@ arguments or JSON, outputs under `--out`, no database or external service.
 
 ## Online flow (all free tiers)
 
+Full ASCII diagrams: `docs/architecture.md` (keep it in sync with changes
+to the flow, R2 layout or endpoints).
+
 ```
 web (Cloudflare Pages) → api (Cloudflare Worker) → R2 bucket desembrick-jobs (1-day lifecycle)
                                   └─ workflow_dispatch → engine `process.yml` on GitHub Actions

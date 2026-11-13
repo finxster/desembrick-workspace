@@ -11,6 +11,9 @@ Desembrick turns an official Lego instruction manual (PDF) into a "reverse
 manual": the parts of each numbered bag, so a mixed set can be sorted back into
 its original bags.
 
+See [docs/architecture.md](docs/architecture.md) for an ASCII architecture
+diagram of the online flow, the engine pipeline and local development.
+
 ## Repositories
 
 | Key | Folder | What it is | Status |
