@@ -1,0 +1,9 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:1080px;height:1920px;overflow:hidden}
+body{font-family:'IBM Plex Sans',sans-serif;background:#F7F6F2;color:#1C1B22;position:relative}
+.d{font-family:'Space Grotesk',sans-serif;font-weight:700;letter-spacing:-0.03em}
+.m{font-family:'IBM Plex Mono',monospace;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+.stud{position:absolute;border-radius:50%}
+.brick{position:absolute;border-radius:28px;display:grid;grid-template-columns:1fr 1fr;gap:18px;padding:26px}
+.brick i{border-radius:50%;background:rgba(255,255,255,.28);aspect-ratio:1}
