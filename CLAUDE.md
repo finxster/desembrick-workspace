@@ -30,6 +30,9 @@ The one contract already known is the engine's output JSON, which
 { "set": "...", "bags": [ { "number": 1, "pages": [1, 2], "parts": [ { "image": "path.png", "quantity": 4 } ] } ] }
 ```
 
+Bags opened together ("open bags 1 and 2") are one entry with an extra
+`"numbers": [1, 2]`; `number` is then the first of them.
+
 The engine must keep working fully standalone: command line only, inputs via
 arguments or JSON, outputs under `--out`, no database or external service.
 
