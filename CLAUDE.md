@@ -53,6 +53,10 @@ the CLI. Changing the R2 layout or `status.json` touches all three repos.
 Job creation needs a Turnstile token (managed mode) and is rate limited per IP.
 Audit records live in `audit/<id>/api.json` (api) and `audit/<id>/runner.json`
 (runner), kept 90 days; IPs only as salted hashes.
+The runner saves work under `cache/<inputs>/<analysis>/` (30 days; part
+pictures and outputs, never the uploaded PDF), keyed by `desembrick --cache-key`:
+the same manual is not read again, by anyone, until the engine's analysis code
+changes. `force_reparse` on `process.yml` (maintainer only) ignores it.
 
 ## Brand
 

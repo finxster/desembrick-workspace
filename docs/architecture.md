@@ -23,6 +23,8 @@ change routing and the JSON contract.
   │                              │        │  jobs/<id>/input/<n>  (PDFs)   │
   │ POST /api/jobs   (Turnstile, │        │  jobs/<id>/out/...  (results)  │
   │                   rate limit)│        │    (1-day lifecycle)           │
+  │                              │        │  cache/<inputs>/<analysis>/... │
+  │                              │        │    (saved work, 30 days)       │
   │ PUT  /api/jobs/:id/input/:n  │        │  audit/<id>/api.json           │
   │ POST /api/jobs/:id/start     │        │  audit/<id>/runner.json        │
   │ GET  /api/jobs/:id           │        │    (90 days, hashed IPs)       │
@@ -69,6 +71,30 @@ uploading ──▶ queued ──▶ running ──▶ done
 The engine has no server, database or network dependency: the runner only
 wraps the CLI and copies `--out` to `jobs/<id>/out/` as is.
 
+## Saved work (runner `cache/`)
+
+The engine's first half (up to "aggregate per bag") does not depend on
+lang/paper/labels: `--analysis-dir` saves it and `--from-analysis` renders from
+it. The runner keys saved work by `desembrick --cache-key` =
+`<inputs sha256>/<analysis code>/<engine code>`, so the same manual is not read
+again, whoever sends it:
+
+```
+ runner: key = --cache-key <pdfs>
+     │
+     ├─ cache/<inputs>/<analysis>/<engine>/<lang>-<paper>.tar ? ──yes──▶ copy it (nothing runs)
+     │
+     ├─ cache/<inputs>/<analysis>/analysis.tar ? ──yes──▶ --from-analysis (PDF not read)
+     │                                                    └─ refused/broken ──┐
+     └─ no, or force_reparse ────────────────────────────────────────────────┴─▶ full run
+                                                                   + save analysis.tar
+     then save <lang>-<paper>.tar unless it was copied (best effort)
+```
+
+A fix in the analysis code changes `<analysis>`: every manual is read again.
+A fix only in the PDF or labels changes `<engine>`: rendered again from the
+saved analysis. `force_reparse` is a maintainer-only input of `process.yml`.
+
 ## Local development (`dbrick start`)
 
 ```
@@ -83,6 +109,7 @@ wraps the CLI and copies `--out` to `jobs/<id>/out/` as is.
 |---|---|---|
 | Output JSON (`set`, `bags[].number/pages/parts`) | engine | api (serves), web (renders) |
 | R2 layout `jobs/<id>/...` + `status.json` states | api + runner | api, web |
+| R2 `cache/...` (saved work), `--cache-key` format | engine | runner only |
 | `process.yml` dispatch inputs | engine | api |
 | Brand tokens / SVGs (`docs/brand/`) | workspace | web (copied), engine (PDF layout) |
 
