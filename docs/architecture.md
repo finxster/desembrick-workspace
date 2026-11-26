@@ -46,6 +46,12 @@ uploading ──▶ queued ──▶ running ──▶ done
                                  └─▶ error
 ```
 
+On `error`, `status.json` holds `errorCode` (`different_sets`, `same_file`,
+`same_booklet`, `no_pages`, `unreadable`, `engine`, `internal`) and
+`"<stage> failed"`. The engine's own output goes only to
+`audit/<id>/runner.json` and the Actions log. The web shows a text per code
+plus the job id, and `runner.json` links that id to the run (`runUrl`).
+
 ## Engine pipeline (standalone CLI)
 
 ```
