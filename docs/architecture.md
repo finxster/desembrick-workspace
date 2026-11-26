@@ -46,6 +46,12 @@ uploading ──▶ queued ──▶ running ──▶ done
                                  └─▶ error
 ```
 
+Before uploading, the web reads each cover with pdf.js through a range
+transport (a few MB of a 30 MB manual): different set numbers stop it there;
+no set number in text (a cover that is only a picture) asks the user for it,
+sent as `setNumber` → `options.setNumber` → workflow input `set_number` →
+`--set-number`.
+
 On `error`, `status.json` holds `errorCode` (`different_sets`, `same_file`,
 `same_booklet`, `no_pages`, `unreadable`, `engine`, `internal`) and
 `"<stage> failed"`. The engine's own output goes only to
